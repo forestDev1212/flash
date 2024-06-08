@@ -363,6 +363,13 @@ impl<'a> TransactionBuilder<'a> {
             legacy: false,
         }
     }
+
+    pub fn extend_ix(mut self, ixs: Vec<Instruction>) -> Self {
+        self.ixs.extend(ixs);
+
+        self
+    }
+
     /// Use legacy tx mode
     pub fn legacy(mut self) -> Self {
         self.legacy = true;
@@ -848,16 +855,64 @@ impl<'a> TransactionBuilder<'a> {
         self
     }
 
-    pub fn get_trigger_order_ix(
+    pub fn trigger_order_ix(
         mut self,
-        user_account_pubkey: Pubkey,
-        user_account: User,
-        order: Order,
-        filler_pubkey: Option<Pubkey>,
-    ) {
-        let filler_pubkey = filler_pubkey.unwrap_or(user_account_pubkey);
+        filler: &Pubkey,
+        user: &Pubkey,
+        order_id: u32,
+        remaining_accounts: Vec<AccountMeta>,
+    ) -> Self {
+        let mut accounts = build_accounts(
+            self.program_data,
+            drift::accounts::TriggerOrder {
+                state: *state_account(),
+                filler: *filler,
+                authority: self.authority,
+                user: *user,
+            },
+            &[],
+            &[],
+            &[],
+        );
 
-        // let remaining_account_params =
+        accounts.extend(remaining_accounts);
+
+        let ix = Instruction {
+            program_id: constants::PROGRAM_ID,
+            accounts,
+            data: InstructionData::data(&drift::instruction::TriggerOrder { order_id }),
+        };
+        self.ixs.push(ix);
+
+        self
+    }
+
+    pub fn revert_fill(mut self, filler: &Pubkey, filler_stats: &Pubkey) -> Self {
+        let accounts = build_accounts(
+            self.program_data,
+            drift::accounts::RevertFill {
+                state: *state_account(),
+                authority: self.authority,
+                filler: *filler,
+                filler_stats: *filler_stats,
+            },
+            &[],
+            &[],
+            &[],
+        );
+
+        let ix = Instruction {
+            program_id: constants::PROGRAM_ID,
+            accounts,
+            data: InstructionData::data(&drift::instruction::RevertFill {}),
+        };
+        self.ixs.push(ix);
+
+        self
+    }
+
+    pub fn tx_params(mut self, tx_params: TxParams) -> Self {
+        self
     }
 
     /// Build the transaction message ready for signing and sending

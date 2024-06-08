@@ -39,7 +39,7 @@ use crate::{
     event_emitter::EventEmitter,
     marketmap::MarketMap,
     oraclemap::{Oracle, OracleMap},
-    types::{Context, DataAndSlot, MarketId, SdkError, SdkResult},
+    types::{Context, DataAndSlot, MarketId, SdkError, SdkResult, TxParams},
     user::DriftUser,
     user_config::UserSubscriptionConfig,
     utils::{self, decode, get_ws_url},
@@ -175,7 +175,10 @@ where
         sub_account_id.unwrap_or(self.active_sub_account_id)
     }
 
-    async fn get_remaining_accounts(&self, params: RemainingAccountParams) -> SdkResult<()> {
+    async fn get_remaining_accounts(
+        &self,
+        params: RemainingAccountParams,
+    ) -> SdkResult<Vec<AccountMeta>> {
         let (mut oracle_account_map, mut spot_market_account_map, mut perp_market_account_map) =
             self.get_remaining_account_maps_for_users(&params.user_accounts)
                 .await?;
@@ -236,8 +239,66 @@ where
 
         // TODO
         // https://github.com/drift-labs/protocol-v2/blob/507e79afb919662f9872405246599977ab6d93dd/sdk/src/driftClient.ts#L1565
+        // for perp_market_index in self.backend.perp
 
-        Ok(())
+        if let Some(spot_indexes) = params.readable_spot_market_indexes {
+            for spot_index in spot_indexes {
+                self.add_spot_market_to_remaining_account_maps(
+                    spot_index,
+                    false,
+                    &mut oracle_account_map,
+                    &mut spot_market_account_map,
+                )
+                .await?;
+            }
+        }
+
+        // TODO
+        // https://github.com/drift-labs/protocol-v2/blob/507e79afb919662f9872405246599977ab6d93dd/sdk/src/driftClient.ts#L1586
+        // for perp_market_index in self.backend.perp
+
+        if let Some(perp_indexes) = params.writable_perp_market_indexes {
+            for perp_index in perp_indexes {
+                self.add_perp_market_to_remaining_account_maps(
+                    perp_index,
+                    true,
+                    &mut oracle_account_map,
+                    &mut spot_market_account_map,
+                    &mut perp_market_account_map,
+                )
+                .await?;
+            }
+        }
+
+        if let Some(spot_indexes) = params.writable_spot_market_indexes {
+            for spot_index in spot_indexes {
+                self.add_perp_market_to_remaining_account_maps(
+                    spot_index,
+                    true,
+                    &mut oracle_account_map,
+                    &mut spot_market_account_map,
+                    &mut perp_market_account_map,
+                )
+                .await?;
+            }
+        }
+        let mut account_metas = Vec::new();
+        let oracle_values = oracle_account_map
+            .into_values()
+            .collect::<Vec<AccountMeta>>();
+        account_metas.extend(oracle_values);
+
+        let spot_values = spot_market_account_map
+            .into_values()
+            .collect::<Vec<AccountMeta>>();
+        account_metas.extend(spot_values);
+
+        let perp_values = perp_market_account_map
+            .into_values()
+            .collect::<Vec<AccountMeta>>();
+        account_metas.extend(perp_values);
+
+        Ok(account_metas)
     }
 
     async fn add_perp_market_to_remaining_account_maps(
@@ -624,6 +685,10 @@ where
             .map(|x| x.data)
     }
 
+    pub fn get_spot_market_accounts(&self) -> Vec<SpotMarket> {
+        self.backend.get_spot_market_accounts()
+    }
+
     pub fn num_perp_markets(&self) -> usize {
         self.backend.num_perp_markets()
     }
@@ -652,6 +717,83 @@ where
             .get_oracle_price_data_and_slot_for_spot_market(market_index)
     }
 
+    pub async fn trigger_order(
+        &self,
+        user_account_pubkey: &Pubkey,
+        user_account: User,
+        order: &Order,
+        trigger_order: Option<TxParams>,
+        filler_pubkey: Option<&Pubkey>,
+    ) -> SdkResult<Signature> {
+        let ix = self
+            .get_trigger_order_ix(user_account_pubkey, user_account, order, filler_pubkey)
+            .await?;
+
+        let tx = TransactionBuilder::new(
+            self.program_data(),
+            self.wallet.default_sub_account(),
+            Cow::Owned(user_account),
+            false,
+        )
+        .extend_ix(vec![ix])
+        .build();
+
+        let sig = self.sign_and_send(tx).await?;
+
+        Ok(sig)
+    }
+
+    pub async fn get_trigger_order_ix(
+        &self,
+        user_account_pubkey: &Pubkey,
+        user_account: User,
+        order: &Order,
+        filler_pubkey: Option<&Pubkey>,
+    ) -> SdkResult<Instruction> {
+        let drifit_user = self.get_user(None).unwrap();
+        let filler = filler_pubkey.unwrap_or(&drifit_user.pubkey);
+
+        let remainint_accounts_params = if MarketType::Perp == order.market_type {
+            RemainingAccountParams {
+                user_accounts: vec![user_account],
+                writable_perp_market_indexes: Some(vec![order.market_index]),
+                writable_spot_market_indexes: None,
+                readable_spot_market_indexes: None,
+                readable_perp_market_indexes: None,
+                use_market_last_slot_cache: None,
+            }
+        } else {
+            RemainingAccountParams {
+                user_accounts: vec![user_account],
+                writable_perp_market_indexes: None,
+                writable_spot_market_indexes: Some(vec![
+                    order.market_index,
+                    QUOTE_SPOT_MARKET_INDEX,
+                ]),
+                readable_spot_market_indexes: None,
+                readable_perp_market_indexes: None,
+                use_market_last_slot_cache: None,
+            }
+        };
+
+        let remaining_accounts = self
+            .get_remaining_accounts(remainint_accounts_params)
+            .await?;
+
+        let order_id = order.order_id;
+
+        let ix = &TransactionBuilder::new(
+            self.program_data(),
+            self.wallet.default_sub_account(),
+            Cow::Owned(user_account),
+            false,
+        )
+        .trigger_order_ix(filler, user_account_pubkey, order_id, remaining_accounts)
+        .ixs[0];
+
+        Ok(ix.clone())
+    }
+
     pub async fn get_update_funding_rate_ix(
         &self,
         perp_market_index: u16,
@@ -670,6 +812,32 @@ where
             false,
         )
         .update_funding_rate(perp_market_index, &perp_market.pubkey, oracle_pubkey)
+        .ixs[0];
+
+        Ok(ix.clone())
+    }
+
+    pub async fn get_revert_fill_ix(
+        &self,
+        filler_pubkey: Option<&Pubkey>,
+    ) -> SdkResult<Instruction> {
+        let drifit_user = self.get_user(None).unwrap();
+        let filler = filler_pubkey.unwrap_or(&drifit_user.pubkey);
+
+        let filler_stats = self.get_user_stats(self.wallet().authority()).await?;
+
+        let account_data: User = self
+            .backend
+            .get_account(&self.wallet.default_sub_account())
+            .await?;
+
+        let ix = &TransactionBuilder::new(
+            self.program_data(),
+            self.wallet.default_sub_account(),
+            Cow::Owned(account_data),
+            false,
+        )
+        .revert_fill(filler, &filler_stats.authority)
         .ixs[0];
 
         Ok(ix.clone())
@@ -807,6 +975,10 @@ impl<T: AccountProvider> DriftClientBackend<T> {
         self.perp_market_map.get(&market_index)
     }
 
+    fn get_perp_market_accounts(&self) -> Vec<PerpMarket> {
+        self.perp_market_map.values()
+    }
+
     fn get_spot_market_account_and_slot(
         &self,
         market_index: u16,
@@ -814,8 +986,8 @@ impl<T: AccountProvider> DriftClientBackend<T> {
         self.spot_market_map.get(&market_index)
     }
 
-    fn get_perp_market_accounts(&self) -> Vec<PerpMarket> {
-        self.perp_market_map.values()
+    fn get_spot_market_accounts(&self) -> Vec<SpotMarket> {
+        self.spot_market_map.values()
     }
 
     fn num_perp_markets(&self) -> usize {
