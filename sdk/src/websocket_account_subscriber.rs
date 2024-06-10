@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use log::info;
 use solana_account_decoder::{UiAccount, UiAccountEncoding};
 use solana_client::{nonblocking::pubsub_client::PubsubClient, rpc_config::RpcAccountInfoConfig};
 use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
@@ -9,6 +10,7 @@ use solana_sdk::{commitment_config::CommitmentConfig, pubkey::Pubkey};
 use crate::{
     accounts::AccountSubscriber,
     event_emitter::{Event, EventEmitter},
+    types::SdkError,
     SdkResult,
 };
 
@@ -86,6 +88,8 @@ impl<T> WebsocketAccountSubscriber<T> {
 
         let url = self.url.clone();
 
+        info!("subscribing {}", self.subscription_name);
+
         tokio::spawn({
             let event_emitter = self.event_emitter.clone();
             let mut latest_slot = 0;
@@ -133,15 +137,13 @@ impl<T> WebsocketAccountSubscriber<T> {
                                 }
                             }
                         },
-                        Err(_) => {
-                            log::error!(
-                                "{}: Failed to subscribe to account stream, retrying",
-                                subscription_name
-                            );
+                        Err(e) => {
+                            log::error!("{subscription_name}: Failed to subscribe to account stream, retrying: {e}");
                             attempt += 1;
+                            log::info!("Number of attempt: {attempt}");
                             if attempt >= max_reconnection_attempts {
-                                log::error!("Max reconnection attempts reached.");
-                                return Err(crate::SdkError::MaxReconnectionAttemptsReached);
+                                log::error!("Max reconnection attempts {attempt} reached.");
+                                return Err(SdkError::MaxReconnectionAttemptsReached);
                             }
                         }
                     }

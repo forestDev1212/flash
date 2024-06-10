@@ -788,8 +788,7 @@ where
             Cow::Owned(user_account),
             false,
         )
-        .trigger_order_ix(filler, user_account_pubkey, order_id, remaining_accounts)
-        .ixs[0];
+        .trigger_order_ix(filler, user_account_pubkey, order_id, remaining_accounts);
 
         Ok(ix.clone())
     }
@@ -923,13 +922,21 @@ impl<T: AccountProvider> DriftClientBackend<T> {
     }
 
     async fn subscribe(&self) -> SdkResult<()> {
-        tokio::try_join!(
-            self.perp_market_map.subscribe(),
-            self.spot_market_map.subscribe(),
-            self.oracle_map.subscribe(),
-            self.state_subscribe(),
-            BlockhashSubscriber::subscribe(self.blockhash_subscriber.clone()),
-        )?;
+        let mut subscriber = self.blockhash_subscriber.write().await;
+
+        self.perp_market_map.subscribe().await?;
+        self.spot_market_map.subscribe().await?;
+        self.oracle_map.subscribe().await?;
+        self.state_subscribe().await?;
+        subscriber.subscribe().await?;
+
+        // tokio::try_join!(
+        //     self.perp_market_map.subscribe(),
+        //     self.spot_market_map.subscribe(),
+        //     self.oracle_map.subscribe(),
+        //     self.state_subscribe(),
+        //     subscriber.subscribe()
+        // )?;
         Ok(())
     }
 
@@ -964,6 +971,8 @@ impl<T: AccountProvider> DriftClientBackend<T> {
         });
 
         subscription.subscribe().await?;
+
+        log::info!("Done subscribing state");
 
         Ok(())
     }
@@ -1156,7 +1165,7 @@ impl<T: AccountProvider> DriftClientBackend<T> {
         config: RpcSendTransactionConfig,
     ) -> SdkResult<Signature> {
         let blockhash_reader = self.blockhash_subscriber.read().await;
-        let recent_block_hash = blockhash_reader.get_valid_blockhash();
+        let recent_block_hash = blockhash_reader.get_valid_blockhash().await;
         drop(blockhash_reader);
         let tx = wallet.sign_tx(tx, recent_block_hash)?;
         self.rpc_client
