@@ -333,21 +333,28 @@ where
                 .map_err(|e| e.to_string())
                 .await?,
         );
-        ixs.push(
-            drift_client
-                .get_revert_fill_ix(None)
-                .await
-                .map_err(|e| e.to_string())?,
-        );
+        // ixs.push(
+        //     drift_client
+        //         .get_revert_fill_ix(None)
+        //         .await
+        //         .map_err(|e| e.to_string())?,
+        // );
 
-        let sub_account = drift_client.wallet().default_sub_account();
-        let tx = drift_client
+        let sub_account = drift_client.wallet().authority();
+        let user_account_pubkey = drift_client.get_user(Some(0)).ok_or("failed to get user")?;
+        let msg = drift_client
             .init_tx(&sub_account, false)
             .map_err(|e| e.to_string())?
-            .extend_ix(ixs)
+            .trigger_order_ix(
+                Some(&user_account_pubkey.pubkey),
+                &node_to_trigger.get_user_account(),
+                node_to_trigger.get_order().order_id,
+                vec![],
+            )
+            // .extend_ix(ixs)
             .build();
 
-        match drift_client.sign_and_send(tx).await {
+        match drift_client.sign_and_send(msg, false).await {
             Ok(sig) => {
                 info!(
                     "Triggered perp user (account: {}) perp order: {}",

@@ -14,9 +14,11 @@ use drift::{
 use futures_util::TryFutureExt;
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::{
+    client_error::ClientErrorKind,
     nonblocking::rpc_client::RpcClient,
     rpc_config::{RpcAccountInfoConfig, RpcProgramAccountsConfig, RpcSendTransactionConfig},
     rpc_filter::{Memcmp, RpcFilterType},
+    rpc_request::{RpcError, RpcResponseErrorData},
 };
 use solana_sdk::{
     account_info::IntoAccountInfo,
@@ -549,9 +551,13 @@ where
     /// Sign and send a tx to the network
     ///
     /// Returns the signature on success
-    pub async fn sign_and_send(&self, tx: VersionedMessage) -> SdkResult<Signature> {
+    pub async fn sign_and_send(
+        &self,
+        tx: VersionedMessage,
+        additional_signers: bool,
+    ) -> SdkResult<Signature> {
         self.backend
-            .sign_and_send(self.wallet(), tx)
+            .sign_and_send(self.wallet(), tx, additional_signers)
             .await
             .map_err(|err| err.to_out_of_sol_error().unwrap_or(err))
     }
@@ -729,7 +735,7 @@ where
             .get_trigger_order_ix(user_account_pubkey, user_account, order, filler_pubkey)
             .await?;
 
-        let tx = TransactionBuilder::new(
+        let msg = TransactionBuilder::new(
             self.program_data(),
             self.wallet.default_sub_account(),
             Cow::Owned(user_account),
@@ -738,7 +744,7 @@ where
         .extend_ix(vec![ix])
         .build();
 
-        let sig = self.sign_and_send(tx).await?;
+        let sig = self.sign_and_send(msg, true).await?;
 
         Ok(sig)
     }
@@ -782,15 +788,20 @@ where
 
         let order_id = order.order_id;
 
-        let ix = &TransactionBuilder::new(
+        let transaction_builer = &TransactionBuilder::new(
             self.program_data(),
             self.wallet.default_sub_account(),
             Cow::Owned(user_account),
             false,
         )
-        .trigger_order_ix(filler, user_account_pubkey, order_id, remaining_accounts);
+        .trigger_order_ix(
+            Some(filler),
+            user_account_pubkey,
+            order_id,
+            remaining_accounts,
+        );
 
-        Ok(ix.clone())
+        Ok(transaction_builer.ixs[0].clone())
     }
 
     pub async fn get_update_funding_rate_ix(
@@ -1139,19 +1150,52 @@ impl<T: AccountProvider> DriftClientBackend<T> {
         &self,
         wallet: &Wallet,
         tx: VersionedMessage,
+        additional_signers: bool,
     ) -> SdkResult<Signature> {
         let blockhash_reader = self.blockhash_subscriber.read().await;
+        let recent_block_hash = blockhash_reader.get_valid_blockhash().await;
         drop(blockhash_reader);
-        let recent_block_hash = self
-            .rpc_client
-            .get_latest_blockhash()
-            .await
-            .expect("get recent blockhash");
-        let tx = wallet.sign_tx(tx, recent_block_hash)?;
-        self.rpc_client
-            .send_transaction(&tx)
-            .await
-            .map_err(|err| err.into())
+
+        let tx = match wallet.sign_tx(tx, recent_block_hash, additional_signers) {
+            Ok(tx) => tx,
+            Err(e) => {
+                return Err(SdkError::Generic(format!(
+                    "Failed to sign and send at DriftBackend: {e}",
+                )))
+            }
+        };
+        let sig = match self.rpc_client.send_transaction(&tx).await {
+            Ok(sig) => sig,
+            Err(e) => match e.kind() {
+                ClientErrorKind::RpcError(rpc_error) => {
+                    if let RpcError::RpcResponseError {
+                        code,
+                        message,
+                        data,
+                    } = rpc_error
+                    {
+                        if let RpcResponseErrorData::SendTransactionPreflightFailure(res) = data {
+                            if let Some(logs) = &res.logs {
+                                for log in logs {
+                                    log::error!("Error Log: {log}");
+                                }
+                            }
+                        }
+                        log::error!("Error Code: {code}, Error Message: {message}, ")
+                    }
+                    return Err(SdkError::Generic(format!(
+                        "Failed to send transaction at DriftBackend: {e}"
+                    )));
+                }
+                _ => {
+                    return Err(SdkError::Generic(format!(
+                        "Failed to send transaction at DriftBackend: {e}"
+                    )))
+                }
+            },
+        };
+
+        Ok(sig)
     }
 
     /// Sign and send a tx to the network with custom send config
@@ -1167,7 +1211,7 @@ impl<T: AccountProvider> DriftClientBackend<T> {
         let blockhash_reader = self.blockhash_subscriber.read().await;
         let recent_block_hash = blockhash_reader.get_valid_blockhash().await;
         drop(blockhash_reader);
-        let tx = wallet.sign_tx(tx, recent_block_hash)?;
+        let tx = wallet.sign_tx(tx, recent_block_hash, false)?;
         self.rpc_client
             .send_transaction_with_config(&tx, config)
             .await
