@@ -9,7 +9,11 @@ use log::info;
 use sdk::{
     accounts::BulkAccountLoader,
     blockhash_subscriber::BlockhashSubscriber,
-    dlob::dlob_subscriber::DLOBSubscriber,
+    clock::clock_subscriber::ClockSubscriber,
+    dlob::{
+        dlob_subscriber::DLOBSubscriber,
+        types::{DLOBSubscriptionConfig, DlobSource, SlotSource},
+    },
     drift_client::DriftClient,
     jupiter::JupiterClient,
     priority_fee::priority_fee_subscriber::PriorityFeeSubscriber,
@@ -18,6 +22,7 @@ use sdk::{
     usermap::{user_stats_map::UserStatsMap, UserMap},
     AccountProvider,
 };
+use solana_client::nonblocking::pubsub_client::PubsubClient;
 use solana_sdk::{
     address_lookup_table_account::AddressLookupTableAccount,
     commitment_config::{CommitmentConfig, CommitmentLevel},
@@ -42,6 +47,7 @@ where
     dry_run: bool,
     // default_interval_ms: u16,
     slot_subscriber: SlotSubscriber,
+    clock_subscriber: ClockSubscriber,
     bulk_account_loader: Option<BulkAccountLoader>,
     // user_stats_map_subscription_config: &'a UserSubscriptionConfig<U>,
     drift_client: Arc<DriftClient<T, U>>,
@@ -126,9 +132,10 @@ where
 
 impl<'a, T, U> FillerBot<'a, T, U>
 where
-    T: AccountProvider,
+    T: AccountProvider + Clone,
+    U: Send + Sync + Clone + 'static,
 {
-    pub fn new(
+    pub async fn new(
         slot_subscriber: SlotSubscriber,
         bulk_account_loader: Option<BulkAccountLoader>,
         drift_client: Arc<DriftClient<T, U>>,
@@ -218,12 +225,17 @@ where
             Pubkey::from_str("8UJgxaiQx5nTrdDgph5FiahMmzduuLTLf5WmsPegYA6W").unwrap(),
         ]);
 
+        let pubsub_client = PubsubClient::new("wss://api.devnet.solana.com/")
+            .await
+            .expect("init pubsub client");
+
         Self {
             global_config,
             filler_config: filler_config.clone(),
             name: filler_config.base_config.bot_id,
             dry_run: filler_config.base_config.dry_run,
             slot_subscriber,
+            clock_subscriber: ClockSubscriber::new(Arc::new(pubsub_client), None),
             // tx_confirmation_connection,
             bulk_account_loader,
             // user_stats_map_subscription_config: &user_stats_map_subscription_config,
@@ -262,7 +274,7 @@ where
         }
     }
 
-    pub fn base_init(&mut self) {
+    pub async fn base_init(&mut self) {
         let start_init_user_stats_map = Instant::now();
         info!("Initializing user_stats_map");
 
@@ -282,6 +294,29 @@ where
 
         self.user_stats_map = Some(user_stats_map);
 
-        // self.clock_subscriber.subscribe().await;
+        self.clock_subscriber
+            .subscribe()
+            .await
+            .expect("subscribe clock");
+
+        self.lookup_table_account = Some(self.drift_client.fetch_market_lookup_table_account());
+    }
+
+    pub async fn init(&mut self) {
+        self.base_init().await;
+        let drift_client = self.drift_client.clone();
+        let user_map = self.user_map.clone().unwrap();
+        let slot_subscriber = self.slot_subscriber.clone();
+
+        self.dlob_subscriber = Some(DLOBSubscriber::new(DLOBSubscriptionConfig {
+            drift_client,
+            dlob_source: DlobSource::UserMap(user_map),
+            slot_source: SlotSource::SlotSubscriber(slot_subscriber),
+            update_frequency: Duration::from_millis((self.polling_interval_ms - 500) as u64),
+        }));
+
+        if let Some(dlob_subscriber) = &self.dlob_subscriber {
+            dlob_subscriber.subscribe().await.unwrap();
+        }
     }
 }
