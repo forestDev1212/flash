@@ -5,12 +5,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+use drift::state::perp_market::PerpMarket;
 use log::info;
 use sdk::{
     accounts::BulkAccountLoader,
     blockhash_subscriber::BlockhashSubscriber,
     clock::clock_subscriber::ClockSubscriber,
     dlob::{
+        dlob::DLOB,
         dlob_subscriber::DLOBSubscriber,
         types::{DLOBSubscriptionConfig, DlobSource, SlotSource},
     },
@@ -18,7 +20,6 @@ use sdk::{
     jupiter::JupiterClient,
     priority_fee::priority_fee_subscriber::PriorityFeeSubscriber,
     slot_subscriber::SlotSubscriber,
-    user_config::UserSubscriptionConfig,
     usermap::{user_stats_map::UserStatsMap, UserMap},
     AccountProvider,
 };
@@ -38,8 +39,10 @@ use crate::{
 };
 
 const DEFAULT_INTERVAL_MS: u16 = 6000;
+const FILL_ORDER_THROTTLE_BACKOFF: u64 = 1000; // the time to wait before trying to fill a throttled (error filling) node again
+const THROTTLED_NODE_SIZE_TO_PRUNE: usize = 10; // Size of throttled nodes to get to before pruning the map
 
-struct FillerBot<'a, T, U>
+struct FillerBot<'a, T>
 where
     T: AccountProvider,
 {
@@ -50,7 +53,7 @@ where
     clock_subscriber: ClockSubscriber,
     bulk_account_loader: Option<BulkAccountLoader>,
     // user_stats_map_subscription_config: &'a UserSubscriptionConfig<U>,
-    drift_client: Arc<DriftClient<T, U>>,
+    drift_client: Arc<DriftClient<T>>,
     /// Connection to use specifically for confirming transactions
     // tx_confirmation_connection: RpcClient,
     polling_interval_ms: u16,
@@ -61,10 +64,10 @@ where
 
     filler_config: FillerConfig,
     global_config: GlobalConfig,
-    dlob_subscriber: Option<DLOBSubscriber<T, U>>,
+    dlob_subscriber: Option<DLOBSubscriber<T>>,
 
     user_map: Option<UserMap>,
-    user_stats_map: Option<UserStatsMap<T, U>>,
+    user_stats_map: Option<UserStatsMap<T>>,
 
     // periodic_task_mutex = new Mutex();
 
@@ -72,7 +75,7 @@ where
     watchdog_timer_last_pat_time: Instant,
 
     interval_ids: Vec<Instant>,
-    throttled_nodes: HashMap<String, u16>,
+    throttled_nodes: HashMap<String, Instant>,
     filling_nodes: HashMap<String, u16>,
     triggering_nodes: HashMap<String, u16>,
 
@@ -81,7 +84,7 @@ where
     fill_tx_id: u16,
     last_settle_pnl: Instant,
 
-    priority_fee_subscriber: PriorityFeeSubscriber<T, U>,
+    priority_fee_subscriber: PriorityFeeSubscriber<T>,
     blockhash_subscriber: BlockhashSubscriber,
     /// stores txSigs that need to been confirmed in a slower loop, and the time they were confirmed
     // protected pendingTxSigsToconfirm: LRUCache<
@@ -130,20 +133,19 @@ where
     rebalance_settled_pnl_threshold: f64,
 }
 
-impl<'a, T, U> FillerBot<'a, T, U>
+impl<'a, T> FillerBot<'a, T>
 where
     T: AccountProvider + Clone,
-    U: Send + Sync + Clone + 'static,
 {
     pub async fn new(
         slot_subscriber: SlotSubscriber,
         bulk_account_loader: Option<BulkAccountLoader>,
-        drift_client: Arc<DriftClient<T, U>>,
+        drift_client: Arc<DriftClient<T>>,
         user_map: UserMap,
         runtime_spec: RuntimeSpec,
         global_config: GlobalConfig,
         filler_config: FillerConfig,
-        mut priority_fee_subscriber: PriorityFeeSubscriber<T, U>,
+        mut priority_fee_subscriber: PriorityFeeSubscriber<T>,
         blockhash_subscriber: BlockhashSubscriber,
         bundle_sender: Option<BundleSender>,
     ) -> Self {
@@ -318,5 +320,89 @@ where
         if let Some(dlob_subscriber) = &self.dlob_subscriber {
             dlob_subscriber.subscribe().await.unwrap();
         }
+
+        log::info!("[{}]: started", self.name);
+    }
+
+    pub async fn reset(&mut self) {
+        if let Some(dlob_sub) = &mut self.dlob_subscriber {
+            dlob_sub.unsubscribe().await;
+        }
+        if let Some(user_map) = &mut self.user_map {
+            user_map.unsubscribe().await.expect("unsubscribe usermap");
+        }
+    }
+
+    pub async fn start_interval_loop(&mut self) {
+        // self.try
+    }
+
+    async fn get_dlob(&self) -> Option<DLOB> {
+        if let Some(dlob_sub) = &self.dlob_subscriber {
+            return Some(dlob_sub.get_dlob().await);
+        }
+
+        None
+    }
+
+    fn get_max_slot(&self) -> u64 {
+        let slot_x = self.slot_subscriber.get_slot();
+        let slot_y = match &self.user_map {
+            Some(map) => map.get_latest_slot(),
+            None => 0,
+        };
+
+        std::cmp::max(slot_x, slot_y)
+    }
+
+    fn log_slots(&self) {
+        let slot = match self.user_map {
+            Some(map) => map.get_latest_slot(),
+            None => 0,
+        };
+        log::info!(
+            "slot_subscriber slot: {}, user_map slot: {}",
+            self.slot_subscriber.get_slot(),
+            slot
+        );
+    }
+
+    fn get_perp_nodes_for_market(&self, market: PerpMarket, dlob: DLOB)  {
+        let market_index = market.market_index;
+
+        let oracle_price_data = self.drift_client.get_oracle_price_data_and_slot_for_perp_market(market_index);
+        if let Some(oracle_price_data) = oracle_price_data {
+            // let v_ask = calculate_ask_price
+        }
+    }
+
+    fn prune_throttled_node(&mut self) {
+        if self.throttled_nodes.len() > THROTTLED_NODE_SIZE_TO_PRUNE {
+            let now = Instant::now();
+            let duration_threshold = Duration::new(2_u64 * FILL_ORDER_THROTTLE_BACKOFF, 0);
+
+            self.throttled_nodes
+                .retain(|_, v| *v + duration_threshold <= now)
+        }
+    }
+
+    async fn try_fill(&mut self) {
+        let start_time = Instant::now();
+        let ran = false;
+
+        if !self.has_enough_sol_to_fill {
+            log::info!("Not enough SOL to fill, skipping fill");
+            return;
+        }
+
+        let user = self.drift_client.get_user(None);
+
+        let dlob = self.get_dlob().await;
+        self.prune_throttled_node();
+
+        // 1) get all fillable nodes
+        let mut fillable_nodes = Vec::new();
+        let mut triggerable_nodes = Vec::new();
+        for market in self.drift_client.get_perp_market_accounts() {}
     }
 }
