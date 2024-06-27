@@ -7,6 +7,7 @@ pub mod config;
 pub mod error;
 pub mod filler;
 pub mod funding_rate_updater;
+pub mod maker_selection;
 pub mod metrics;
 pub mod trigger;
 pub mod types;

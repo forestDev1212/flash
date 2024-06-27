@@ -8,7 +8,10 @@ use base64::Engine;
 use log::info;
 use sdk::{
     config::DriftEnv,
-    dlob::dlob_node::{get_order_signature, DLOBNode, Node},
+    dlob::{
+        dlob::NodeToFill,
+        dlob_node::{get_order_signature, DLOBNode, Node},
+    },
 };
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -17,10 +20,23 @@ use solana_sdk::{
     hash::Hash,
     instruction::Instruction,
     message::{v0::Message, VersionedMessage},
+    pubkey::Pubkey,
     signature::Keypair,
     signer::Signer,
     transaction::{TransactionError, VersionedTransaction},
 };
+
+pub fn get_node_to_fill_signature(node: &NodeToFill) -> String {
+    let user_account = node.get_node().get_user_account();
+    get_order_signature(node.get_node().get_order().order_id, user_account)
+}
+
+pub fn get_fill_signature_from_user_account_and_orader_id(
+    user_account: Pubkey,
+    order_id: u32,
+) -> String {
+    get_order_signature(order_id, user_account)
+}
 
 pub fn get_node_to_trigger_signature(node: &Node) -> String {
     get_order_signature(node.get_order().order_id, node.get_user_account())
